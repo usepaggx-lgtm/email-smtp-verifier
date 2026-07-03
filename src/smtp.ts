@@ -1,9 +1,16 @@
 import * as net from 'net'
+import * as tls from 'tls'
 
 const HELO_DOMAIN = 'mail.emailvalidator.dev'
 const FROM_EMAIL = 'noreply@emailvalidator.dev'
-const SMTP_PORT = 25
 const TIMEOUT = 10000
+
+const PORTS = [
+  { port: 25, secure: false, starttls: false },
+  { port: 587, secure: false, starttls: true },
+  { port: 465, secure: true, starttls: false },
+  { port: 2525, secure: false, starttls: false },
+]
 
 interface SMTPResult {
   deliverable: boolean
@@ -21,38 +28,55 @@ export async function verifySMTP(
   domain: string,
   retries: number
 ): Promise<SMTPResult> {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const result = await trySMTP(mxHost, toEmail)
-      if (result.greylisted && attempt < retries) {
-        await sleep(3000)
-        continue
+  const errors: string[] = []
+
+  for (const { port, secure, starttls } of PORTS) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const result = await trySMTP(mxHost, port, secure, starttls, toEmail)
+        if (result.greylisted && attempt < retries) {
+          await sleep(3000)
+          continue
+        }
+        return result
+      } catch (err: any) {
+        const msg = err.message || String(err)
+        if (attempt < retries) {
+          await sleep(2000)
+          continue
+        }
+        errors.push(`port ${port}: ${msg}`)
       }
-      return result
-    } catch (err: any) {
-      if (attempt < retries) {
-        await sleep(2000)
-        continue
-      }
-      return { deliverable: false, greylisted: false, reason: err.message || 'Connection failed' }
     }
   }
-  return { deliverable: false, greylisted: false, reason: 'Max retries' }
+
+  return { deliverable: false, greylisted: false, reason: `All ports failed: ${errors.join('; ')}` }
 }
 
-function trySMTP(mxHost: string, toEmail: string): Promise<SMTPResult> {
+function trySMTP(
+  mxHost: string,
+  port: number,
+  secure: boolean,
+  starttls: boolean,
+  toEmail: string
+): Promise<SMTPResult> {
   return new Promise((resolve, reject) => {
-    const socket = new net.Socket()
+    let socket: net.Socket | tls.TLSSocket
     let buffer = ''
     let step = 0
+    let tlsUpgraded = false
     let timeoutId: NodeJS.Timeout
 
     function resetTimeout() {
       clearTimeout(timeoutId)
       timeoutId = setTimeout(() => {
-        socket.destroy()
+        safeDestroy()
         reject(new Error('Timeout'))
       }, TIMEOUT)
+    }
+
+    function safeDestroy() {
+      try { socket.destroy() } catch {}
     }
 
     function send(line: string) {
@@ -75,15 +99,40 @@ function trySMTP(mxHost: string, toEmail: string): Promise<SMTPResult> {
 
         if (code === 220 && step === 0) {
           step = 1
-          send(`HELO ${HELO_DOMAIN}`)
+          if (starttls && !tlsUpgraded) {
+            send('EHLO ' + HELO_DOMAIN)
+          } else {
+            send(`HELO ${HELO_DOMAIN}`)
+          }
         } else if (code === 250 && step === 1) {
-          step = 2
-          send(`MAIL FROM:<${FROM_EMAIL}>`)
+          if (starttls && !tlsUpgraded) {
+            if (msg.toUpperCase().includes('STARTTLS')) {
+              step = 0
+              send('STARTTLS')
+            } else {
+              safeDestroy()
+              resolve({ deliverable: false, greylisted: false, reason: 'STARTTLS not supported' })
+              return
+            }
+          } else {
+            step = 2
+            send(`MAIL FROM:<${FROM_EMAIL}>`)
+          }
+        } else if (code === 220 && starttls && !tlsUpgraded && step === 0) {
+          const tlsSocket = tls.connect({ socket: socket as net.Socket, servername: mxHost })
+          socket = tlsSocket
+          tlsUpgraded = true
+          step = 0
+          buffer = ''
+          tlsSocket.on('data', onData)
+          tlsSocket.on('error', (err) => { safeDestroy(); reject(err) })
+          resetTimeout()
+          return
         } else if ((code === 250 || code === 251) && step === 2) {
           step = 3
           send(`RCPT TO:<${toEmail}>`)
         } else if (step === 3) {
-          socket.destroy()
+          safeDestroy()
           if (code === 250) {
             resolve({ deliverable: true, greylisted: false, reason: `${code} ${msg}` })
           } else if (code === 450 || code === 451) {
@@ -95,11 +144,11 @@ function trySMTP(mxHost: string, toEmail: string): Promise<SMTPResult> {
           }
           return
         } else if (code >= 400 && code < 500 && step < 3) {
-          socket.destroy()
+          safeDestroy()
           resolve({ deliverable: false, greylisted: true, reason: `${code} ${msg}` })
           return
         } else if (code >= 500 && step < 3) {
-          socket.destroy()
+          safeDestroy()
           resolve({ deliverable: false, greylisted: false, reason: `${code} ${msg}` })
           return
         }
@@ -108,9 +157,14 @@ function trySMTP(mxHost: string, toEmail: string): Promise<SMTPResult> {
     }
 
     resetTimeout()
-    socket.connect(SMTP_PORT, mxHost, () => {
-      // Banner will be received via onData
-    })
+
+    if (secure) {
+      socket = tls.connect({ host: mxHost, port, servername: mxHost }, () => {})
+    } else {
+      socket = new net.Socket()
+      socket.connect(port, mxHost, () => {})
+    }
+
     socket.on('data', onData)
     socket.on('error', (err) => {
       clearTimeout(timeoutId)
