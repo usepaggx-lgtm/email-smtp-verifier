@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { serve } from '@hono/node-server'
 import { verifySMTP } from './smtp'
 import { resolveMX } from './dns'
 
@@ -53,5 +54,6 @@ app.post('/verify', async (c) => {
 })
 
 const port = parseInt(process.env.PORT || '3001')
+console.log(`SMTP Verifier starting on port ${port}`)
+serve({ fetch: app.fetch, port })
 console.log(`SMTP Verifier running on port ${port}`)
-export default { port, fetch: app.fetch }
